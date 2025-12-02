@@ -1,141 +1,136 @@
 // server/routes/payments.js
 const express = require("express");
-const Stripe = require("stripe");
-const bodyParser = require("body-parser");
-const Product = require("../models/Product");
-const Order = require("../models/Order");
-
 const router = express.Router();
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const mongoose = require("mongoose");
+const Product = require("../models/Product");
+const stripeSecret = process.env.STRIPE_SECRET_KEY || "";
+let stripe = null;
+if (stripeSecret) stripe = require("stripe")(stripeSecret);
+else
+  console.warn(
+    "STRIPE_SECRET_KEY not set — payment-intent retrieval will fail"
+  );
 
-// POST /api/create-payment-intent
-router.post("/create-payment-intent", async (req, res) => {
-  try {
-    const { items = [], metadata = {} } = req.body;
+/**
+ * Helper: compute total amount (in smallest currency unit) from items.
+ * items expected: [{ productId?, qty, unitPrice, title, snapshot? }]
+ * If productId is valid ObjectId and exists we use DB price; otherwise we use item.unitPrice.
+ */
+async function computeTotalAmount(items = []) {
+  let total = 0;
+  for (const it of items) {
+    const qty = Math.max(1, Number(it.qty || 1));
+    let price = 0;
 
-    // Validate and compute total server-side
-    let total = 0;
-    for (const it of items) {
-      if (it.productId) {
-        const product = await Product.findById(it.productId).lean();
-        if (!product)
-          return res
-            .status(400)
-            .json({ error: `Invalid productId ${it.productId}` });
-        total += product.price * (it.qty || 1);
-      } else {
-        total += (it.unitPrice || 0) * (it.qty || 1);
+    // If productId looks like a Mongo id, try DB lookup (safe with isValid)
+    if (it.productId && mongoose.Types.ObjectId.isValid(it.productId)) {
+      try {
+        const prod = await Product.findById(it.productId).lean();
+        if (prod && typeof prod.price !== "undefined") {
+          price = Number(prod.price || 0);
+        } else {
+          // fallback to provided unitPrice / snapshot
+          price = Number(
+            it.unitPrice ?? (it.snapshot && it.snapshot.price) ?? 0
+          );
+        }
+      } catch (e) {
+        console.warn(
+          "Product lookup failed in payment calc for id",
+          it.productId,
+          e?.message || e
+        );
+        price = Number(it.unitPrice ?? (it.snapshot && it.snapshot.price) ?? 0);
       }
+    } else {
+      // demo/external item — use provided unitPrice or snapshot
+      price = Number(it.unitPrice ?? (it.snapshot && it.snapshot.price) ?? 0);
     }
 
-    const amount = Math.round(total * 100);
-    if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+    total += price * qty;
+  }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
-      currency: "inr",
-      automatic_payment_methods: { enabled: true },
-      metadata: {
-        ...metadata,
-      },
+  // Stripe expects amount in smallest currency unit (e.g., paise for INR)
+  const amountInPaisa = Math.round(total * 100);
+  return amountInPaisa;
+}
+
+/**
+ * GET /api/payment-intent/:id
+ * Retrieves PaymentIntent by id (server-side), returns safe summary including metadata.
+ * Example: GET /api/payment-intent/pi_1JXXXXXX
+ */
+
+router.get("/payment-intent/:id", async (req, res) => {
+  try {
+    if (!stripe)
+      return res.status(500).json({ error: "Stripe not configured on server" });
+    const { id } = req.params;
+    if (!id)
+      return res.status(400).json({ error: "Missing payment intent id" });
+
+    // Only allow ids that look like a stripe payment intent id (start with 'pi_')
+    if (!id.startsWith("pi_"))
+      return res.status(400).json({ error: "Invalid payment intent id" });
+
+    const pi = await stripe.paymentIntents.retrieve(id);
+    // return minimal safe info
+    return res.json({
+      id: pi.id,
+      amount: pi.amount,
+      currency: pi.currency,
+      status: pi.status,
+      metadata: pi.metadata || {},
     });
-
-    res.json({ clientSecret: paymentIntent.client_secret });
   } catch (err) {
-    console.error("create-payment-intent error", err);
-    res.status(500).json({ error: err.message });
+    console.error("payment intent retrieve error", err);
+    const msg =
+      err?.raw?.message || err?.message || "Could not retrieve payment intent";
+    return res.status(500).json({ error: msg });
   }
 });
 
 /**
- * Webhook endpoint
- * Use raw body for signature verification.
+ * POST /api/create-payment-intent
+ * Body: { items: [...], metadata?: {...}, currency?: 'inr' | 'usd' ... }
  */
-router.post(
-  "/webhook",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-    let event;
-
-    try {
-      if (webhookSecret) {
-        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-      } else {
-        // Fallback for environments without webhook secret (not recommended)
-        event = JSON.parse(req.body.toString());
-      }
-    } catch (err) {
-      console.error("Webhook signature verification failed.", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
+router.post("/create-payment-intent", async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(500).json({
+        error: "Stripe not configured on server (STRIPE_SECRET_KEY missing)",
+      });
     }
 
-    try {
-      switch (event.type) {
-        case "payment_intent.succeeded": {
-          const pi = event.data.object;
-          const metadata = pi.metadata || {};
-          const orderId = metadata.orderId || null;
+    const { items = [], metadata = {}, currency = "inr" } = req.body;
 
-          console.log("PaymentIntent succeeded:", pi.id, "orderId:", orderId);
-
-          // If orderId provided via metadata, find that order and update
-          if (orderId) {
-            const order = await Order.findById(orderId);
-            if (order) {
-              order.paymentIntentId = pi.id;
-              order.paymentStatus = "succeeded";
-              await order.save();
-              console.log(`Order ${order._id} marked as succeeded`);
-            } else {
-              console.warn(
-                "Webhook: orderId metadata provided but order not found:",
-                orderId
-              );
-            }
-          } else {
-            // Try to find order by paymentIntentId (older flows)
-            const order = await Order.findOne({ paymentIntentId: pi.id });
-            if (order) {
-              order.paymentStatus = "succeeded";
-              await order.save();
-              console.log(
-                `Order ${order._id} marked as succeeded (matched by paymentIntentId)`
-              );
-            } else {
-              console.warn("Webhook: no order found for paymentIntent:", pi.id);
-            }
-          }
-          break;
-        }
-
-        case "payment_intent.payment_failed": {
-          const pi = event.data.object;
-          const metadata = pi.metadata || {};
-          const orderId = metadata.orderId || null;
-          console.log("PaymentIntent failed:", pi.id, "orderId:", orderId);
-          if (orderId) {
-            await Order.findByIdAndUpdate(orderId, { paymentStatus: "failed" });
-          } else {
-            await Order.findOneAndUpdate(
-              { paymentIntentId: pi.id },
-              { paymentStatus: "failed" }
-            );
-          }
-          break;
-        }
-
-        default:
-          console.log(`Unhandled stripe event: ${event.type}`);
-      }
-
-      res.json({ received: true });
-    } catch (err) {
-      console.error("Error handling webhook event:", err);
-      res.status(500).send("Server error handling webhook");
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "No items provided" });
     }
+
+    // compute amount defensively
+    const amount = await computeTotalAmount(items);
+    if (amount <= 0) {
+      return res.status(400).json({ error: "Computed amount is zero" });
+    }
+
+    // create PaymentIntent
+    const pi = await stripe.paymentIntents.create({
+      amount,
+      currency,
+      // optional: enable automatic payment methods for flexibility
+      automatic_payment_methods: { enabled: true },
+      metadata: metadata || {},
+    });
+
+    return res.json({ clientSecret: pi.client_secret, paymentIntentId: pi.id });
+  } catch (err) {
+    console.error("create-payment-intent error", err);
+    // expose safe error info to client for debugging
+    const msg =
+      err?.raw?.message || err?.message || "Payment intent creation failed";
+    return res.status(500).json({ error: msg });
   }
-);
+});
 
 module.exports = router;
